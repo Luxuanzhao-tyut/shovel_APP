@@ -1,0 +1,25 @@
+# 现场可调参数
+# 修改后重启“露天矿电铲样机控制台”即可生效，不需要重新生成 UI。
+# 速度接口按百分比工程值使用：100 表示 PLC 远程速度接口的 100% 给定。
+speed:
+  # 控制界面启动时默认显示的速度给定
+  default_percent: 10.0
+
+  # 控制界面允许输入的最大速度，同时也是程序后台的真实写入限幅。
+  # 建议现场按 10 -> 20 -> 30 逐级验证，不要一次直接提高到 100。
+  max_percent: 50.0
+
+  # 速度输入框每次点击上下箭头的增量
+  step_percent: 1.0
+
+  # 自动到目标时允许设置的最小速度上限
+  auto_min_percent: 1.0
+
+# 机构限位方向与上位机监督保护
+# 提升方向已由 2026-09-28 真机测试确认：提升时编码器下降，触发 lift_limit 后应禁止继续提升。
+# 推压限位方向目前尚未完成同等级真机标定，默认按“推出端限位”处理；
+# 如果现场确认实际是“收回端限位”，只需把 push_blocked_direction 改为 backward 后重启程序。
+limits:
+  auto_stop_on_limit: true
+  lift_blocked_direction: up       # up=禁止提升；down=禁止下放
+  push_blocked_direction: forward # forward=禁止推出；backward=禁止收回

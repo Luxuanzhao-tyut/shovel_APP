@@ -1,0 +1,66 @@
+lift:
+  source_type: INFERENCE
+  confidence: PARTIALLY_CONFIRMED
+  verification_status: NOT_TESTED_ON_PLC
+  input_address: '%ID46'
+  input_source:
+    file: PLCTags.xlsx
+    sha256: d55cb1dfe393e516e8d4cac0242ae3a07e1903a9ca40bcc28d59a14db6fa1ee0
+    source_type: TIA_GLOBAL_TAG_TABLE
+    sheet: PLC Tags
+    range: A67:E67
+    row: 67
+  internal_conversion: UNKNOWN
+  db_address: DB400.DBD142
+  db_source:
+    file: 太理数据对接0612.xlsx
+    sha256: 3c0bea16c19ac76544ce3782aaf18d554126124e9cae350c3feee0b3a2a14c98
+    source_type: JAVA_MYSQL_POINT_TABLE
+    sheet: 电铲发送
+    row: 38
+    range: H38:K38
+    address_cell: J38
+  python_method: read_lift_encoder
+  note: 只确认两端存在，中间连线未由梯形图证明；不假设数值相等
+push:
+  source_type: INFERENCE
+  confidence: PARTIALLY_CONFIRMED
+  verification_status: NOT_TESTED_ON_PLC
+  input_address: '%ID62'
+  input_source:
+    file: PLCTags.xlsx
+    sha256: d55cb1dfe393e516e8d4cac0242ae3a07e1903a9ca40bcc28d59a14db6fa1ee0
+    source_type: TIA_GLOBAL_TAG_TABLE
+    sheet: PLC Tags
+    range: A68:E68
+    row: 68
+  internal_conversion: UNKNOWN
+  db_address: DB400.DBD146
+  db_source:
+    file: 太理数据对接0612.xlsx
+    sha256: 3c0bea16c19ac76544ce3782aaf18d554126124e9cae350c3feee0b3a2a14c98
+    source_type: JAVA_MYSQL_POINT_TABLE
+    sheet: 电铲发送
+    row: 39
+    range: H39:K39
+    address_cell: J39
+  python_method: read_push_encoder
+  note: 只确认两端存在，中间连线未由梯形图证明；不假设数值相等
+swing:
+  source_type: INFERENCE
+  confidence: PARTIALLY_CONFIRMED
+  verification_status: NOT_TESTED_ON_PLC
+  input_address: UNKNOWN
+  input_source: null
+  internal_conversion: UNKNOWN
+  db_address: DB400.DBD150
+  db_source:
+    file: 太理数据对接0612.xlsx
+    sha256: 3c0bea16c19ac76544ce3782aaf18d554126124e9cae350c3feee0b3a2a14c98
+    source_type: JAVA_MYSQL_POINT_TABLE
+    sheet: 电铲发送
+    row: 40
+    range: H40:K40
+    address_cell: J40
+  python_method: read_swing_angle
+  note: 只确认两端存在，中间连线未由梯形图证明；不假设数值相等

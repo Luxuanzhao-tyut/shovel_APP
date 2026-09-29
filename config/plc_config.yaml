@@ -1,0 +1,45 @@
+# 2026-09-24 已确认样机 PLC IP 为 192.168.2.20；Excel 中 192.168.0.10 仅保留为历史来源证据。
+plc:
+  active_ip: "192.168.2.20"
+  rack: 0
+  slot: 1
+source_notes:
+  java_source_ip: "192.168.2.20"
+  excel_source_ip: "192.168.0.10"
+  ip_status: "SITE_CONFIRMED"
+  site_ip_confirmed: true
+  site_confirmation_note: "2026-09-24 用户确认样机 PLC IP=192.168.2.20"
+  java_source: "S7Constant.java"
+  excel_source: "太理数据对接0612.xlsx / 电铲发送!A1"
+  excel_protocol_note: "原表提及 MODBUS TCP 等方式；Java 实际使用 S7。本阶段不切换协议。"
+runtime:
+  sample_period_ms: 100
+safety:
+  # 文件落盘仍保持 fail-closed；控制界面 在 PLC 连接成功后仅在内存中打开写许可。
+  # 每条运动/模式/制动命令仍由 LiveControlManager 按 DB400 状态自动联锁。
+  write_enabled: false
+  dry_run: true
+  java_speed_range: [-100.0, 100.0]
+  approved_ranges: {}
+
+live_control:
+  # arm_phrase 仅保留兼容旧接口；控制界面 不再显示人工武装流程。
+  arm_phrase: "现场已清场，硬急停可用"
+  heartbeat_period_ms: 100
+  heartbeat_max_failures: 3
+  # Java S7WriteUtils.writePulseAsync 的历史实现为 2000 ms；现场可再缩短验证。
+  legacy_pulse_ms: 2000
+  max_state_age_ms: 600
+  real_readback_tolerance: 0.0001
+  # 兼容旧版本字段；当前速度上限以 config/operator_settings.yaml 为准。
+  commissioning_speed_range: [-50.0, 50.0]
+  require_high_voltage_for_motion: false
+  require_rectifier_for_motion: true
+logging:
+  console: true
+  save_to_file: true
+legacy:
+  replay_period_ms: 100
+  swing_speed_divisor: 13.2
+  swing_speed_sign: -1
+  demo_speed: 5.0
