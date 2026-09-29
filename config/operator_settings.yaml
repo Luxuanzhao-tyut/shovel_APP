@@ -23,3 +23,28 @@ limits:
   auto_stop_on_limit: true
   lift_blocked_direction: up       # up=禁止提升；down=禁止下放
   push_blocked_direction: forward # forward=禁止推出；backward=禁止收回
+
+# V2.3 连续挖掘轨迹控制参数
+# 上位机位置外环输出“速度百分比给定”；电机速度内环仍由 PLC/驱动器完成。
+trajectory_control:
+  # 公共路径进度前方的参考点距离。越大越积极，越小越贴近实际进度。
+  lookahead_fraction: 0.15
+  # 中间途经点达到该共同进度后直接切到下一段，不在中间点停车。
+  waypoint_switch_progress: 0.92
+  # 克服机构低速死区的最小运动给定。最终进入位置容差后仍会置 0。
+  min_moving_percent: 0.8
+  # 速度变化小于此值时不重复写 PLC，减少无意义通信。
+  speed_update_deadband_percent: 0.25
+  # 旧版绝对 P 增益（保留兼容/对照；V2.3.2 连续轨迹默认改用按路径段尺度归一化的 P 外环）。
+  lift_kp_percent_per_count: 0.010
+  push_kp_percent_per_count: 0.010
+  swing_kp_percent_per_deg: 0.50
+
+  # 路径跟踪阶段只使用最终到位容差的一部分作为死区，避免短前视启动锁死。
+  tracking_tolerance_factor: 0.25
+  # 启动/短段前视至少跨过最终容差的倍数。
+  bootstrap_tolerance_margin: 1.5
+
+  # 最终点滞环释放倍数：进入 ±容差后保持停止，漂移超过 2×容差才重新纠偏。
+  # 当前对应提升/推压约 ±40 编码器、回转约 ±2°。
+  final_hold_release_factor: 2.0

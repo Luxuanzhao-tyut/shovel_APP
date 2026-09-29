@@ -14,6 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from plc.config import PROJECT_ROOT
 from trajectory.session_replay import ReplaySession, load_session
+from trajectory.joint_trajectory import (JointTrajectory, JointWaypoint, load_joint_trajectory_file, save_joint_trajectory)
 from ui.control_facade import ControlFacade
 
 
@@ -68,6 +69,11 @@ class ShovelControlApp(tk.Tk):
         self._replay_thread: threading.Thread | None = None
         self._replay_stop = threading.Event()
         self._replay_active = False
+        self._joint_trajectory: JointTrajectory | None = None
+        self._joint_thread: threading.Thread | None = None
+        self._joint_stop = threading.Event()
+        self._joint_active = False
+        self._teaching_path: Path | None = None
         self._remote_start_running = False
         self._rectifier_command_latched = False
         self._brake_ui_latched = {
@@ -268,10 +274,11 @@ class ShovelControlApp(tk.Tk):
         self._mode_buttons['rectifier_start'] = rect_on
         self._mode_buttons['rectifier_stop'] = rect_off
         r2 = ttk.Frame(c, style='Card.TFrame'); r2.pack(fill='x', pady=(5, 0))
+        # 这里只保留操作者真正需要显式选择的两个维度：控制权与机构类别。
+        # “自动/点动”由具体功能入口决定，避免用户在开始轨迹/点动前重复选择模式。
         for text_btn, name, state_key in [
             ('远程', 'remote_mode_button', 'remote_mode'), ('本地', 'local_mode_button', 'local_mode'),
-            ('挖掘', 'dig_mode_button', 'dig_mode'), ('行走', 'walk_mode_button', 'propel_mode'),
-            ('自动', 'auto_unmanned_mode_button', 'auto_unmanned_mode'), ('点动', 'jog_unmanned_mode_button', 'jog_unmanned_mode')]:
+            ('挖掘', 'dig_mode_button', 'dig_mode'), ('行走', 'walk_mode_button', 'propel_mode')]:
             b = self._btn(r2, text_btn, None, 'Primary')
             b.configure(command=lambda n=name, t=text_btn, bb=b: self._pulse(n, t, bb))
             b.pack(side='left', expand=True, fill='x', padx=2)
@@ -308,128 +315,37 @@ class ShovelControlApp(tk.Tk):
         self._hold_button(aux, 'horn_command', '喇 叭').pack(side='left', fill='x', expand=True, padx=4)
 
         ttk.Separator(center).pack(fill='x', pady=4 if self._compact_ui else 7)
-        ttk.Label(center, text='自动到目标', style='Value.TLabel').pack(anchor='w')
-        ttk.Label(
-            center,
-            text='提升/推压输入编码器目标值；回转输入角度。单次只输入 1 个目标。',
-            style='Hint.TLabel'
-        ).pack(anchor='w', pady=(0, 2))
 
-        target_box = ttk.Frame(center, style='Card.TFrame')
-        target_box.pack(fill='x', pady=(1, 0))
-
-        self.target_vars = {
-            'lift': tk.DoubleVar(value=0.0),
-            'push': tk.DoubleVar(value=0.0),
-            'swing': tk.DoubleVar(value=0.0),
-        }
-
-        # 自动到目标默认采用更低速度；后台硬限制最高 5%。
-        auto_default = min(2.0, float(self._speed_max))
-        self.auto_speed_vars = {
-            'lift': tk.DoubleVar(value=auto_default),
-            'push': tk.DoubleVar(value=auto_default),
-            'swing': tk.DoubleVar(value=auto_default),
-        }
-        self.auto_current_vars = {
-            axis: tk.StringVar(value='当前 --') for axis in ('lift', 'push', 'swing')
-        }
-        self.auto_result_vars = {
-            axis: tk.StringVar(value='待命') for axis in ('lift', 'push', 'swing')
-        }
-        self.auto_execute_buttons = {}
-        self.auto_cancel_buttons = {}
-
-        header = ttk.Frame(target_box, style='Card.TFrame')
-        header.pack(fill='x', pady=(0, 1))
-        ttk.Label(header, text='', width=4, style='Hint.TLabel').pack(side='left')
-        ttk.Label(header, text='当前位置', width=14, style='Hint.TLabel').pack(side='left')
-        ttk.Label(header, text='目标值', width=10, style='Hint.TLabel').pack(side='left')
-        ttk.Label(header, text='速度%', width=7, style='Hint.TLabel').pack(side='left')
-
-        axis_rows = [
-            ('lift', '提升'),
-            ('push', '推压'),
-            ('swing', '回转'),
-        ]
-        for axis, title in axis_rows:
-            row = ttk.Frame(target_box, style='Card.TFrame')
-            row.pack(fill='x', pady=1)
-
-            ttk.Label(row, text=title, style='Value.TLabel', width=4).pack(side='left')
-            ttk.Label(
-                row,
-                textvariable=self.auto_current_vars[axis],
-                style='Muted.TLabel',
-                width=14
-            ).pack(side='left')
-
-            # 单目标输入框，不支持逗号多点。
-            ttk.Entry(
-                row,
-                textvariable=self.target_vars[axis],
-                width=10
-            ).pack(side='left', padx=(0, 4))
-
-            ttk.Spinbox(
-                row,
-                from_=0.5,
-                to=min(5.0, float(self._speed_max)),
-                increment=0.5,
-                textvariable=self.auto_speed_vars[axis],
-                width=6
-            ).pack(side='left', padx=(0, 4))
-
-            ttk.Button(
-                row,
-                text='取当前',
-                style='Control.TButton',
-                width=7,
-                command=lambda a=axis: self._take_current_target(a)
-            ).pack(side='left', padx=2)
-
-            btn = ttk.Button(
-                row,
-                text='执行',
-                style='Good.TButton',
-                width=7,
-                command=lambda a=axis: self._execute_auto_target(a)
-            )
-            btn.pack(side='left', padx=2)
-            self.auto_execute_buttons[axis] = btn
-
-            cancel_btn = ttk.Button(
-                row,
-                text='停止',
-                style='Warn.TButton',
-                width=6,
-                command=lambda a=axis: self._cancel_auto_target(a)
-            )
-            cancel_btn.pack(side='left', padx=2)
-            self.auto_cancel_buttons[axis] = cancel_btn
-
-            ttk.Label(
-                row,
-                textvariable=self.auto_result_vars[axis],
-                style='Hint.TLabel',
-                width=16
-            ).pack(side='left', padx=(4, 0))
-
-        ttk.Separator(center).pack(fill='x', pady=4 if self._compact_ui else 7)
-        ttk.Label(center, text='数据记录 / 导入复现', style='Value.TLabel').pack(anchor='w')
+        # ① 示教采集：连接 PLC 后完整 DB400 仍自动落盘；按钮只负责切出一次有效示教片段。
+        ttk.Label(center, text='① 示教数据采集', style='Value.TLabel').pack(anchor='w')
         self.auto_record_var = tk.StringVar(value='')
-        data_row = ttk.Frame(center, style='Card.TFrame'); data_row.pack(fill='x', pady=(2, 2))
-        ttk.Button(data_row, text='导出记录', style='Primary.TButton', command=self._export_auto_record).pack(side='left', fill='x', expand=True, padx=(0, 2))
-        ttk.Button(data_row, text='导入历史 CSV', style='Control.TButton', command=self._import_replay).pack(side='left', fill='x', expand=True, padx=(2, 0))
-        self.replay_info_var = tk.StringVar(value='尚未导入复现数据')
-        replay_row = ttk.Frame(center, style='Card.TFrame'); replay_row.pack(fill='x', pady=(2, 0))
+        teach_row = ttk.Frame(center, style='Card.TFrame'); teach_row.pack(fill='x', pady=(2, 2))
+        ttk.Button(teach_row, text='开始示教采集', style='Good.TButton', command=self._start_teaching_record).pack(side='left', fill='x', expand=True, padx=(0, 2))
+        ttk.Button(teach_row, text='结束示教采集', style='Warn.TButton', command=self._stop_teaching_record).pack(side='left', fill='x', expand=True, padx=2)
+        ttk.Button(teach_row, text='导出完整记录', style='Primary.TButton', command=self._export_auto_record).pack(side='left', fill='x', expand=True, padx=(2, 0))
+        self.teaching_var = tk.StringVar(value='示教采集：未开始（连接 PLC 后完整 DB400 仍会自动记录）')
+        ttk.Label(center, textvariable=self.teaching_var, style='Hint.TLabel').pack(anchor='w', fill='x', pady=(0, 4))
+
+        # ② 历史示教：旧速度序列回放仅作为实验/兼容功能，不与新的闭环挖掘轨迹混淆。
+        ttk.Label(center, text='② 历史示教（实验性速度序列复现）', style='Value.TLabel').pack(anchor='w')
+        hist_row = ttk.Frame(center, style='Card.TFrame'); hist_row.pack(fill='x', pady=(2, 1))
+        ttk.Button(hist_row, text='选择历史示教 CSV', style='Control.TButton', command=self._import_replay).pack(side='left')
+        self.replay_info_var = tk.StringVar(value='尚未选择历史示教数据')
+        ttk.Label(hist_row, textvariable=self.replay_info_var, style='Hint.TLabel').pack(side='left', fill='x', expand=True, padx=8)
+        replay_row = ttk.Frame(center, style='Card.TFrame'); replay_row.pack(fill='x', pady=(1, 4))
         ttk.Label(replay_row, text='复现倍率', style='Muted.TLabel').pack(side='left')
         self.replay_scale_var = tk.IntVar(value=100)
         ttk.Spinbox(replay_row, from_=1, to=100, textvariable=self.replay_scale_var, width=5).pack(side='left', padx=4)
         ttk.Label(replay_row, text='%', style='Muted.TLabel').pack(side='left')
-        self.replay_start_btn = ttk.Button(replay_row, text='开始复现', style='Good.TButton', command=self._start_replay)
+        self.replay_start_btn = ttk.Button(replay_row, text='开始速度复现', style='Good.TButton', command=self._start_replay)
         self.replay_start_btn.pack(side='left', fill='x', expand=True, padx=(8, 2))
-        ttk.Button(replay_row, text='结束复现', style='Warn.TButton', command=self._stop_replay).pack(side='left', fill='x', expand=True, padx=(2, 0))
+        ttk.Button(replay_row, text='停止速度复现', style='Warn.TButton', command=self._stop_replay).pack(side='left', fill='x', expand=True, padx=(2, 0))
+
+        # ③ 新轨迹：面向提升/推压/回转的位置反馈闭环轨迹，和历史速度回放是两套独立功能。
+        ttk.Label(center, text='③ 挖掘轨迹编辑与执行（提升 + 推压 + 回转）', style='Value.TLabel').pack(anchor='w')
+        traj_row = ttk.Frame(center, style='Card.TFrame'); traj_row.pack(fill='x', pady=(2, 0))
+        ttk.Label(traj_row, text='连续路径 + 三轴位置外环调速（中间点不停）', style='Hint.TLabel').pack(side='left', fill='x', expand=True)
+        ttk.Button(traj_row, text='打开挖掘轨迹编辑器', style='Primary.TButton', command=self._open_joint_trajectory_editor).pack(side='right')
 
         feedback = self._card(middle, '关键机构反馈', row=1, column=0, sticky='nsew', pady=(4, 0))
         self._build_key_feedback(feedback)
@@ -501,10 +417,10 @@ class ShovelControlApp(tk.Tk):
         self.key_feedback_vars: dict[str, tk.StringVar] = {}
         items = [
             ('提升编码器', 'lift_encoder'), ('推压编码器', 'push_encoder'), ('回转角度', 'swing_angle'),
-            ('斗杆倾角', 'bucket_tilt_angle'), ('提升电流', 'lift_current'), ('推压电流', 'push_current'),
-            ('回转电流', 'swing_current'), ('提升转矩', 'lift_torque'), ('推压转矩', 'push_torque'),
-            ('回转转矩', 'swing_torque'), ('左履带实际转速', 'left_walk_motor_actual_speed'),
-            ('右履带实际转速', 'right_walk_motor_actual_speed'),
+            ('提升给定速度 %', 'pc_lift_cmd_percent'), ('推压给定速度 %', 'pc_push_cmd_percent'), ('回转给定速度 %', 'pc_swing_cmd_percent'),
+            ('提升实际转速（PLC原值）', 'lift_actual_speed'), ('推压实际转速（PLC原值）', 'push_actual_speed'), ('回转实际转速（PLC原值）', 'swing_actual_speed'),
+            ('提升电流', 'lift_current'), ('推压电流', 'push_current'), ('回转电流', 'swing_current'),
+            ('提升转矩', 'lift_torque'), ('推压转矩', 'push_torque'), ('回转转矩', 'swing_torque'),
         ]
         # 1680×896 一类屏幕使用 3 列×4 行，让反馈区自然占满中下部，而不是上面挤一排、下面留空。
         cols = 3 if self._compact_ui else 3
@@ -514,7 +430,7 @@ class ShovelControlApp(tk.Tk):
             cell = ttk.Frame(grid, style='Card.TFrame', padding=(6, 5))
             cell.grid(row=r, column=c, sticky='nsew', padx=2, pady=2)
             ttk.Label(cell, text=title, style='Hint.TLabel').pack(anchor='w')
-            v = tk.StringVar(value='--')
+            v = tk.StringVar(value='等待 PLC 数据')
             self.key_feedback_vars[key] = v
             ttk.Label(cell, textvariable=v, style='DataValue.TLabel').pack(anchor='w', pady=(2, 0))
         for c in range(cols):
@@ -753,9 +669,21 @@ class ShovelControlApp(tk.Tk):
             else '故障：未知'
         )
 
-        # 关键机构参数每一帧直接写 StringVar。
+        # 关键机构参数每一帧直接写 StringVar。三轴“给定速度%”取本程序真实下发值；
+        # DB400 actual_speed 的工程单位尚未确认，因此保留 PLC 原值，不冒充百分比。
+        try:
+            pc_cmd = self.facade.commanded_speed_percent()
+        except Exception:
+            pc_cmd = {'lift': 0.0, 'push': 0.0, 'swing': 0.0}
+        d['pc_lift_cmd_percent'] = pc_cmd.get('lift', 0.0)
+        d['pc_push_cmd_percent'] = pc_cmd.get('push', 0.0)
+        d['pc_swing_cmd_percent'] = pc_cmd.get('swing', 0.0)
         for key, var in self.key_feedback_vars.items():
-            var.set(self._fmt(d.get(key)))
+            value = d.get(key)
+            if key.startswith('pc_'):
+                var.set(f'{float(value or 0.0):+.2f}%')
+            else:
+                var.set(self._fmt(value))
 
         for axis, (var, pos_key, speed_key) in self.axis_feedback_vars.items():
             suffix = ''
@@ -1310,6 +1238,174 @@ class ShovelControlApp(tk.Tk):
         except Exception as exc:
             self._log(f'停止自动到目标失败：{exc}')
 
+    # ---------------- teaching / joint trajectory ----------------
+    def _start_teaching_record(self) -> None:
+        if not self.facade.connected:
+            messagebox.showwarning('PLC 未连接', '请先连接 PLC，再开始示教采集。')
+            return
+        if self.facade.recorder is not None:
+            messagebox.showwarning('正在记录', '当前已有手工记录任务。')
+            return
+        records_dir = self._runtime_root() / 'records'
+        records_dir.mkdir(parents=True, exist_ok=True)
+        path = records_dir / datetime.now().strftime('示教记录_%Y%m%d_%H%M%S.csv')
+        try:
+            self._teaching_path = self.facade.start_session_recording(path)
+            self.teaching_var.set(f'示教采集中：{self._teaching_path.name}')
+            self._log(f'开始示教采集：{self._teaching_path}')
+        except Exception as exc:
+            messagebox.showerror('示教采集启动失败', str(exc))
+
+    def _stop_teaching_record(self) -> None:
+        if self.facade.recorder is None:
+            self.teaching_var.set('示教采集：未开始')
+            return
+        try:
+            self.facade.stop_recording()
+            name = self._teaching_path.name if self._teaching_path else '记录文件'
+            self.teaching_var.set(f'示教采集已结束：{name}')
+            self._log(f'示教采集结束：{self._teaching_path}')
+        except Exception as exc:
+            messagebox.showerror('停止示教采集失败', str(exc))
+
+    def _open_joint_trajectory_editor(self) -> None:
+        win = tk.Toplevel(self)
+        win.title('挖掘轨迹编辑与执行')
+        win.geometry('880x600')
+        win.transient(self)
+
+        top = ttk.Frame(win, padding=10); top.pack(fill='x')
+        ttk.Label(top, text='挖掘轨迹：提升 + 推压 + 回转', style='Value.TLabel').pack(anchor='w')
+        ttk.Label(top, text='V2.3.4：文件中的 P1 就是正式轨迹首点。开始执行时软件自动读取当前状态，并先自动接入 P1；无需手工添加当前状态点。', style='Muted.TLabel').pack(anchor='w', pady=(2, 6))
+
+        cols=('idx','lift','push','swing')
+        tree=ttk.Treeview(win, columns=cols, show='headings', height=13)
+        heads={'idx':'点','lift':'提升编码器','push':'推压编码器','swing':'回转角 / °'}
+        widths={'idx':65,'lift':220,'push':220,'swing':180}
+        for c in cols:
+            tree.heading(c,text=heads[c]); tree.column(c,width=widths[c],anchor='center')
+        tree.pack(fill='both', expand=True, padx=10)
+
+        edit=ttk.Frame(win,padding=(10,8)); edit.pack(fill='x')
+        vars_={k:tk.DoubleVar(value=0.0) for k in ('lift','push','swing')}
+        for label,key,w in [('提升','lift',14),('推压','push',14),('回转(°)','swing',12)]:
+            ttk.Label(edit,text=label).pack(side='left',padx=(8,2)); ttk.Entry(edit,textvariable=vars_[key],width=w).pack(side='left',padx=(0,8))
+
+        def rows_to_traj():
+            pts=[]
+            for i,iid in enumerate(tree.get_children()):
+                v=tree.item(iid,'values')
+                pts.append(JointWaypoint(float(i),float(v[1]),float(v[2]),float(v[3])))
+            traj=JointTrajectory(tuple(pts),'UI轨迹'); traj.validate(min_points=1); return traj
+
+        def refresh(traj):
+            tree.delete(*tree.get_children())
+            for i,p in enumerate(traj.points):
+                tree.insert('', 'end', values=(f'P{i+1}', f'{p.lift:g}', f'{p.push:g}', f'{p.swing:g}'))
+
+        def add_point():
+            try:
+                tree.insert('', 'end', values=(f'P{len(tree.get_children())+1}', f'{float(vars_["lift"].get()):g}', f'{float(vars_["push"].get()):g}', f'{float(vars_["swing"].get()):g}'))
+            except Exception as exc: messagebox.showerror('输入错误',str(exc),parent=win)
+
+        def load_selected(_event=None):
+            sel=tree.selection()
+            if not sel:return
+            v=tree.item(sel[0],'values')
+            try:
+                vars_['lift'].set(float(v[1])); vars_['push'].set(float(v[2])); vars_['swing'].set(float(v[3]))
+            except Exception: pass
+
+        def modify_selected():
+            sel=tree.selection()
+            if len(sel)!=1:
+                messagebox.showwarning('请选择轨迹点','请先选中一个要修改的轨迹点。',parent=win); return
+            try:
+                iid=sel[0]; old=tree.item(iid,'values')
+                tree.item(iid,values=(old[0],f'{float(vars_["lift"].get()):g}',f'{float(vars_["push"].get()):g}',f'{float(vars_["swing"].get()):g}'))
+            except Exception as exc: messagebox.showerror('修改失败',str(exc),parent=win)
+
+        tree.bind('<<TreeviewSelect>>', load_selected)
+
+        def delete_selected():
+            for iid in tree.selection(): tree.delete(iid)
+            for i,iid in enumerate(tree.get_children()):
+                v=list(tree.item(iid,'values')); v[0]=f'P{i+1}'; tree.item(iid,values=v)
+
+        def import_file():
+            path=filedialog.askopenfilename(parent=win,title='导入挖掘轨迹文件',filetypes=[('轨迹文件','*.xlsx *.csv'),('Excel','*.xlsx'),('CSV','*.csv')])
+            if not path:return
+            try:
+                traj=load_joint_trajectory_file(Path(path)); self._joint_trajectory=traj; refresh(traj)
+                self._log(f'已导入规划轨迹：{Path(path).name}，共 {len(traj.points)} 个正式轨迹点')
+            except Exception as exc: messagebox.showerror('导入失败',str(exc),parent=win)
+
+        def export_csv():
+            try: traj=rows_to_traj()
+            except Exception as exc: messagebox.showerror('轨迹无效',str(exc),parent=win); return
+            path=filedialog.asksaveasfilename(parent=win,title='保存挖掘轨迹',defaultextension='.csv',initialfile='挖掘轨迹.csv',filetypes=[('CSV','*.csv')])
+            if path:
+                try: save_joint_trajectory(Path(path),traj); self._joint_trajectory=traj
+                except Exception as exc: messagebox.showerror('保存失败',str(exc),parent=win)
+
+        btns=ttk.Frame(win,padding=(10,0,10,6)); btns.pack(fill='x')
+        ttk.Button(btns,text='添加输入点',command=add_point).pack(side='left',padx=2)
+        ttk.Button(btns,text='修改选中点',style='Primary.TButton',command=modify_selected).pack(side='left',padx=2)
+        ttk.Button(btns,text='删除选中点',command=delete_selected).pack(side='left',padx=2)
+        ttk.Button(btns,text='导入轨迹文件',command=import_file).pack(side='left',padx=(12,2))
+        ttk.Button(btns,text='保存轨迹 CSV',command=export_csv).pack(side='left',padx=2)
+
+        run=ttk.Frame(win,padding=(10,4,10,10)); run.pack(fill='x')
+        speed=tk.DoubleVar(value=min(2.0,float(self._speed_max)))
+        status=tk.StringVar(value='待命')
+        ttk.Label(run,text=f'轨迹最大速度 %（位置外环会在 0～该上限内自动调速；软件上限 {self._speed_max:g}%）').pack(side='left')
+        ttk.Spinbox(run,from_=0.5,to=float(self._speed_max),increment=0.5,textvariable=speed,width=7).pack(side='left',padx=5)
+        ttk.Label(run,textvariable=status).pack(side='right',padx=8)
+
+        def execute():
+            if self._joint_active:
+                messagebox.showwarning('正在执行','已有联合轨迹正在执行。',parent=win); return
+            if not self.facade.connected:
+                messagebox.showwarning('PLC 未连接','请先连接 PLC。',parent=win); return
+            try: traj=rows_to_traj(); sp=abs(float(speed.get()))
+            except Exception as exc: messagebox.showerror('轨迹无效',str(exc),parent=win); return
+            # V2.3.3：规划文件不再要求包含当前状态点。执行瞬间读取最新 PLC 反馈，
+            # 自动构造 Pcurrent -> P1 的接入段，再连续执行 P1...PN。
+            try:
+                current_lift=float(self._last_state_dict['lift_encoder'])
+                current_push=float(self._last_state_dict['push_encoder'])
+                current_swing=float(self._last_state_dict['swing_angle'])
+            except Exception:
+                messagebox.showwarning('反馈不可用','无法读取当前提升/推压/回转反馈，禁止启动轨迹。',parent=win); return
+            execution_points=[JointWaypoint(0.0,current_lift,current_push,current_swing)]
+            execution_points.extend(JointWaypoint(float(i+1),p.lift,p.push,p.swing) for i,p in enumerate(traj.points))
+            execution_traj=JointTrajectory(tuple(execution_points),f'{traj.name}-自动接入')
+            execution_traj.validate()
+            self._joint_trajectory=traj; self._joint_stop.clear(); self._joint_active=True; status.set('自动接入 P1 / 执行中')
+            self._log(f'轨迹启动：当前状态 ({current_lift:g}, {current_push:g}, {current_swing:g}°) -> P1 ({traj.points[0].lift:g}, {traj.points[0].push:g}, {traj.points[0].swing:g}°) -> 后续轨迹')
+            self.action_var.set(f'当前动作：自动接入 P1 + 挖掘轨迹 · 正式点 {len(traj.points)} 个')
+            def worker():
+                try:
+                    result=self.facade.execute_joint_trajectory(execution_traj,sp)
+                    self._action_queue.put((True,'挖掘联合轨迹',str(result)))
+                    self.after(0,lambda:status.set('已完成'))
+                except Exception as exc:
+                    self._action_queue.put((False,'挖掘联合轨迹',str(exc)))
+                    self.after(0,lambda:status.set('已停止/异常'))
+                finally:
+                    self._joint_active=False
+                    self.after(0,lambda:self.action_var.set('当前动作：无'))
+            self._joint_thread=threading.Thread(target=worker,daemon=True,name='joint-trajectory'); self._joint_thread.start()
+
+        def stop():
+            try: self.facade.cancel_joint_trajectory(); status.set('停止中')
+            except Exception as exc: messagebox.showerror('停止失败',str(exc),parent=win)
+
+        ttk.Button(run,text='开始联合轨迹',style='Good.TButton',command=execute).pack(side='left',padx=(12,3))
+        ttk.Button(run,text='停止轨迹',style='Stop.TButton',command=stop).pack(side='left',padx=3)
+        if self._joint_trajectory is not None:
+            refresh(self._joint_trajectory)
+
     # ---------------- record/export/replay ----------------
     def _export_auto_record(self) -> None:
         src = self._auto_record_path
@@ -1327,7 +1423,7 @@ class ShovelControlApp(tk.Tk):
             messagebox.showerror('导出失败', str(exc))
 
     def _import_replay(self) -> None:
-        path = filedialog.askopenfilename(title='导入历史 CSV', filetypes=[('CSV 数据', '*.csv'), ('所有文件', '*.*')])
+        path = filedialog.askopenfilename(title='选择历史示教 CSV', filetypes=[('CSV 数据', '*.csv'), ('所有文件', '*.*')])
         if not path: return
         try: session = load_session(Path(path), self.POLL_MS / 1000.0)
         except Exception as exc: messagebox.showerror('导入失败', str(exc)); return
@@ -1339,7 +1435,7 @@ class ShovelControlApp(tk.Tk):
     def _start_replay(self) -> None:
         if self._replay_active: return
         if self._replay_session is None:
-            messagebox.showwarning('没有数据', '请先点击“导入历史 CSV”。'); return
+            messagebox.showwarning('没有数据', '请先点击“选择历史示教 CSV”。'); return
         if not self.facade.connected:
             messagebox.showwarning('PLC 未连接', '请先连接 PLC。'); return
         try: scale = int(self.replay_scale_var.get()) / 100.0
@@ -1381,7 +1477,11 @@ class ShovelControlApp(tk.Tk):
         now = time.strftime('%H:%M:%S'); self.log_var.set(f'[{now}] {text}')
 
     def _on_close(self) -> None:
-        self._stop_replay(); self._stop_polling()
+        self._stop_replay()
+        try: self.facade.cancel_joint_trajectory()
+        except Exception: pass
+        self._stop_teaching_record()
+        self._stop_polling()
         try: self.facade.disconnect()
         except Exception: pass
         self.destroy()

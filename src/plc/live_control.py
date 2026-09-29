@@ -239,6 +239,11 @@ class LiveControlManager:
         self._auto_target_lock = threading.Lock()
         self._auto_target_cancel = threading.Event()
         self._auto_target_axis: str | None = None
+        self._joint_trajectory_lock = threading.Lock()
+        self._joint_trajectory_cancel = threading.Event()
+        self._joint_trajectory_active = False
+        # 上位机最近一次实际写给三轴速度接口的百分比给定（带符号），供 UI 实时显示。
+        self._commanded_speed_percent = {'lift': 0.0, 'push': 0.0, 'swing': 0.0}
 
     @property
     def pulse_ms(self) -> int:
@@ -899,6 +904,8 @@ class LiveControlManager:
                 raise ValueError(axis)
             results = [self.writer.write_bool_group(group), self.writer.write_real(speed_name, 0.0)]
             self._active_motion.pop(axis, None)
+            if axis in self._commanded_speed_percent:
+                self._commanded_speed_percent[axis] = 0.0
             return results
 
     def handle_state_update(self, state) -> list[dict]:
@@ -979,6 +986,7 @@ class LiveControlManager:
     def safe_stop_all(self) -> list[dict]:
         """停止顺序：先方向 FALSE，再速度 0。只要求已武装+在线，不依赖远程/故障反馈。"""
         self._auto_target_cancel.set()
+        self._joint_trajectory_cancel.set()
         self._require_armed()
         with self._motion_lock:
             results = [self.writer.write_bool_group({name: False for name in self.DIRECTION_NAMES})]
@@ -1314,6 +1322,246 @@ class LiveControlManager:
             self._auto_target_cancel.clear()
             self._auto_target_lock.release()
 
+    def cancel_joint_trajectory(self) -> dict:
+        """取消三轴联合轨迹，并尽最大努力清零三个机构输出。"""
+        self._joint_trajectory_cancel.set()
+        active = self._joint_trajectory_active
+        for axis in ('lift', 'push', 'swing'):
+            try:
+                self.jog_stop(axis)
+            except Exception:
+                pass
+        return {'cancelled': bool(active)}
+
+    def execute_joint_trajectory(self, trajectory, speed_limit: float = 2.0) -> dict:
+        """V2.3 连续三轴路径跟踪：公共路径进度 + 位置外环生成速度给定。
+
+        中间点是途经点而非停车点。控制器用三轴共同的段进度推进一个前视参考点，
+        每个轴按位置误差比例生成速度给定，并受用户速度上限约束。只有最终点要求
+        三轴全部进入最终容差后停车。真正的电机速度内环仍由 PLC/驱动器完成。
+        """
+        self._require_armed()
+        trajectory.validate()
+        speed_limit = abs(float(speed_limit))
+        self._assert_speed_range(speed_limit)
+        cfg = self.config.get('live_control', {})
+        operator_max = float(self.config.get('operator_settings', {}).get('speed', {}).get('max_percent', 10.0))
+        if not 0 < speed_limit <= operator_max:
+            raise RuntimeError(f'联合轨迹速度必须 >0 且不超过当前现场上限 {operator_max:g}%')
+        if not self._joint_trajectory_lock.acquire(blocking=False):
+            raise RuntimeError('已有联合轨迹正在执行')
+        if self._auto_target_axis is not None:
+            self._joint_trajectory_lock.release()
+            raise RuntimeError('单轴自动到目标正在执行，请先停止')
+
+        enc_tol = float(cfg.get('auto_target_encoder_tolerance', 20.0))
+        swing_tol = float(cfg.get('auto_target_swing_tolerance_deg', 1.0))
+        poll_s = max(0.05, float(cfg.get('joint_trajectory_poll_ms', 100)) / 1000.0)
+        start_factor = float(cfg.get('joint_trajectory_start_tolerance_factor', 2.0))
+        ctl = self.config.get('operator_settings', {}).get('trajectory_control', {})
+        lookahead = min(0.45, max(0.03, float(ctl.get('lookahead_fraction', 0.15))))
+        switch_progress = min(0.995, max(0.70, float(ctl.get('waypoint_switch_progress', 0.92))))
+        min_speed = max(0.1, float(ctl.get('min_moving_percent', 0.8)))
+        speed_deadband = max(0.05, float(ctl.get('speed_update_deadband_percent', 0.25)))
+        tracking_tol_factor = max(0.05, min(0.8, float(ctl.get('tracking_tolerance_factor', 0.25))))
+        bootstrap_margin = max(1.05, float(ctl.get('bootstrap_tolerance_margin', 1.5)))
+        kp = {
+            'lift': max(1e-6, float(ctl.get('lift_kp_percent_per_count', 0.010))),
+            'push': max(1e-6, float(ctl.get('push_kp_percent_per_count', 0.010))),
+            'swing': max(1e-6, float(ctl.get('swing_kp_percent_per_deg', 0.50))),
+        }
+
+        self._joint_trajectory_cancel.clear()
+        self._joint_trajectory_active = True
+        active_dir = {'lift': None, 'push': None, 'swing': None}
+        active_speed = {'lift': 0.0, 'push': 0.0, 'swing': 0.0}
+        # V2.3.4 最终点滞环保持：某轴一旦进入最终容差就锁停；只有漂移超过释放阈值才重新纠偏。
+        final_hold = {'lift': False, 'push': False, 'swing': False}
+        hold_release_factor = max(1.1, float(ctl.get('final_hold_release_factor', 2.0)))
+        started_at = time.monotonic()
+
+        def feedbacks():
+            states = {a: self._axis_conditions(a) for a in ('lift', 'push', 'swing')}
+            return states, {a: self._auto_target_feedback(a, states[a]) for a in states}
+
+        def stop_axis(axis):
+            if active_dir[axis] is not None:
+                self.jog_stop(axis)
+                active_dir[axis] = None
+                active_speed[axis] = 0.0
+
+        def command_axis(axis, direction, magnitude, state):
+            magnitude = min(speed_limit, max(min_speed, float(magnitude)))
+            self._check_directional_limit(axis, direction, state)
+            if active_dir[axis] != direction:
+                stop_axis(axis)
+                self.jog_start(axis, direction, magnitude)
+                active_dir[axis] = direction
+                active_speed[axis] = magnitude
+                return
+            if abs(magnitude - active_speed[axis]) < speed_deadband:
+                return
+            # 方向位保持不变时只更新 REAL 速度给定，避免每 100 ms 反复撤销/重置方向位。
+            signed = self._signed_jog_speed(axis, direction, magnitude)
+            speed_name = {'lift': 'lift_right_set_speed', 'push': 'push_left_set_speed', 'swing': 'rotation_set_speed'}[axis]
+            with self._motion_lock:
+                self.writer.write_real(speed_name, signed)
+                self._commanded_speed_percent[axis] = float(signed)
+            active_speed[axis] = magnitude
+
+        def shortest_delta(a, b):
+            return (float(b) - float(a) + 180.0) % 360.0 - 180.0
+
+        def segment_reference(a, b, r):
+            r = min(1.0, max(0.0, float(r)))
+            return {
+                'lift': a.lift + r * (b.lift - a.lift),
+                'push': a.push + r * (b.push - a.push),
+                'swing': a.swing + r * shortest_delta(a.swing, b.swing),
+            }
+
+        def axis_progress(axis, a, b, value):
+            if axis == 'swing':
+                delta = shortest_delta(a.swing, b.swing)
+                moved = shortest_delta(a.swing, value)
+            else:
+                av = a.lift if axis == 'lift' else a.push
+                bv = b.lift if axis == 'lift' else b.push
+                delta = bv - av
+                moved = float(value) - av
+            tol = swing_tol if axis == 'swing' else enc_tol
+            if abs(delta) <= tol:
+                return None
+            return min(1.2, max(-0.2, moved / delta))
+
+        try:
+            states, cur = feedbacks()
+            first = trajectory.points[0]
+            first_targets = {'lift': first.lift, 'push': first.push, 'swing': first.swing}
+            for axis in ('lift', 'push', 'swing'):
+                err = self._auto_target_error(axis, first_targets[axis], cur[axis])
+                tol = swing_tol if axis == 'swing' else enc_tol
+                if abs(err) > start_factor * tol:
+                    raise RuntimeError(
+                        f'轨迹起点与当前{axis}反馈不一致：当前={cur[axis]:.3f}, '
+                        f'起点={first_targets[axis]:.3f}；请先“取当前状态为起点”'
+                    )
+
+            segment_index = 0
+            passed_waypoints = 1
+            while True:
+                if self._joint_trajectory_cancel.is_set():
+                    raise RuntimeError('联合轨迹已取消')
+                states, cur = feedbacks()
+                final = trajectory.points[-1]
+                final_targets = {'lift': final.lift, 'push': final.push, 'swing': final.swing}
+                final_errors = {a: self._auto_target_error(a, final_targets[a], cur[a]) for a in ('lift','push','swing')}
+                # V2.3.5：只有真正推进到最后一段后，才允许按最终点判定“已完成”。
+                # 之前若新一轮启动时当前位置恰好靠近上一轮终点 Pn，会在尚未执行
+                # Pcurrent->P1 前就直接返回 reached，表现为“点击执行但不动，一直显示已完成”。
+                is_on_final_segment = segment_index == len(trajectory.points) - 2
+                if (is_on_final_segment
+                        and abs(final_errors['lift']) <= enc_tol
+                        and abs(final_errors['push']) <= enc_tol
+                        and abs(final_errors['swing']) <= swing_tol):
+                    for axis in ('lift','push','swing'):
+                        stop_axis(axis)
+                    return {'status': 'reached', 'elapsed_s': time.monotonic() - started_at,
+                            'passed_waypoints': len(trajectory.points), 'final': cur}
+
+                a = trajectory.points[segment_index]
+                b = trajectory.points[segment_index + 1]
+                progresses = []
+                for axis in ('lift','push','swing'):
+                    pr = axis_progress(axis, a, b, cur[axis])
+                    if pr is not None:
+                        progresses.append(pr)
+                common_progress = min(progresses) if progresses else 1.0
+
+                # 中间点在共同进度接近末端时直接切换下一段，不要求三轴在该点停车。
+                if segment_index < len(trajectory.points) - 2 and common_progress >= switch_progress:
+                    segment_index += 1
+                    passed_waypoints = max(passed_waypoints, segment_index + 1)
+                    a = trajectory.points[segment_index]
+                    b = trajectory.points[segment_index + 1]
+                    progresses = [p for axis in ('lift','push','swing') if (p := axis_progress(axis,a,b,cur[axis])) is not None]
+                    common_progress = min(progresses) if progresses else 0.0
+
+                # V2.3.1：自适应“胡萝卜”前视。固定 15% 在短段上可能小于最终到位容差，
+                # 从而出现 q_ref≈q、三轴首周期都判停、公共进度永远无法启动的死锁。
+                # 对每个真正需要运动的轴，保证前视至少跨过该轴最终容差的 bootstrap_margin 倍。
+                required_lookahead = lookahead
+                for axis in ('lift', 'push', 'swing'):
+                    if axis == 'swing':
+                        delta = abs(shortest_delta(a.swing, b.swing)); tol = swing_tol
+                    else:
+                        av = a.lift if axis == 'lift' else a.push
+                        bv = b.lift if axis == 'lift' else b.push
+                        delta = abs(bv - av); tol = enc_tol
+                    if delta > tol:
+                        required_lookahead = max(required_lookahead, bootstrap_margin * tol / delta)
+                ref_progress = min(1.0, max(0.0, common_progress) + required_lookahead)
+                refs = segment_reference(a, b, ref_progress)
+                is_final_segment = segment_index == len(trajectory.points) - 2
+
+                for axis in ('lift','push','swing'):
+                    err = self._auto_target_error(axis, refs[axis], cur[axis])
+                    final_err = self._auto_target_error(axis, final_targets[axis], cur[axis])
+                    tol = swing_tol if axis == 'swing' else enc_tol
+                    # 只有“最终点”使用完整到位容差停车。路径跟踪阶段使用更小的跟踪死区，
+                    # 防止中间参考点因为落入最终容差而把轴锁死。
+                    if is_final_segment and ref_progress >= 1.0:
+                        # Schmitt-trigger 式终点保持。进入 tol 后锁停，不因几个计数的回弹立即反向；
+                        # 只有漂移超过 hold_release_factor*tol 才解除保持并重新纠偏。
+                        if final_hold[axis]:
+                            if abs(final_err) <= hold_release_factor * tol:
+                                stop_axis(axis)
+                                continue
+                            final_hold[axis] = False
+                        if abs(final_err) <= tol:
+                            final_hold[axis] = True
+                            stop_axis(axis)
+                            continue
+                    else:
+                        final_hold[axis] = False
+                    tracking_tol = max(1e-6, tracking_tol_factor * tol)
+                    if abs(err) <= tracking_tol:
+                        stop_axis(axis)
+                        continue
+                    direction = self._auto_target_direction(axis, err)
+                    # V2.3.2 归一化 P 位置外环：speed_limit 现在是真正可达到的轨迹速度上限。
+                    # 旧版直接用 Kp*位置误差，而前视参考只领先约 15%，导致即使用户填 20%，
+                    # 提升/回转常常只有 0.8% 左右。这里用“当前段的前视位移”归一化误差：
+                    # 落后一个完整前视距离 -> 接近 speed_limit；追上胡萝卜 -> 比例降速；
+                    # 最终段 ref=终点后，同一尺度自然形成减速区。
+                    if axis == 'swing':
+                        segment_delta = abs(shortest_delta(a.swing, b.swing))
+                    else:
+                        av = a.lift if axis == 'lift' else a.push
+                        bv = b.lift if axis == 'lift' else b.push
+                        segment_delta = abs(bv - av)
+                    full_scale_error = max(2.0 * tracking_tol, required_lookahead * segment_delta)
+                    normalized_error = min(1.0, abs(err) / max(1e-6, full_scale_error))
+                    desired_speed = speed_limit * normalized_error
+                    command_axis(axis, direction, desired_speed, states[axis])
+
+                if self._joint_trajectory_cancel.wait(poll_s):
+                    raise RuntimeError('联合轨迹已取消')
+        finally:
+            for axis in ('lift', 'push', 'swing'):
+                try:
+                    self.jog_stop(axis)
+                except Exception:
+                    pass
+            self._joint_trajectory_active = False
+            self._joint_trajectory_cancel.clear()
+            self._joint_trajectory_lock.release()
+
+    def commanded_speed_percent(self) -> dict[str, float]:
+        """返回上位机最近实际下发的三轴速度百分比（带符号）。"""
+        with self._motion_lock:
+            return dict(self._commanded_speed_percent)
+
     def set_speed_only(self, axis: str, value: float) -> dict:
         """工程调速：非零时仍要求完整机构联锁；并要求对应方向当前为 FALSE。"""
         self._assert_speed_range(value)
@@ -1384,6 +1632,8 @@ class LiveControlManager:
                 self.writer.write_bool_group(group),
             ]
             self._active_motion[axis] = canonical
+            if axis in self._commanded_speed_percent:
+                self._commanded_speed_percent[axis] = float(signed_speed)
             return results
 
     def jog_stop(self, axis: str) -> list[dict]:

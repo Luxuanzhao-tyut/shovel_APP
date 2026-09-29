@@ -178,6 +178,23 @@ class ControlFacade:
             }
         return self.live.execute_auto_target(axis, target, speed_limit)
 
+    def execute_joint_trajectory(self, trajectory, speed_limit: float = 2.0):
+        if not self.armed:
+            return {'preview': True, 'kind': 'JOINT_TRAJECTORY',
+                    'points': len(trajectory.points), 'duration_s': trajectory.duration_s,
+                    'speed_limit': float(speed_limit)}
+        return self.live.execute_joint_trajectory(trajectory, speed_limit)
+
+    def commanded_speed_percent(self) -> dict[str, float]:
+        if not self.live:
+            return {'lift': 0.0, 'push': 0.0, 'swing': 0.0}
+        return self.live.commanded_speed_percent()
+
+    def cancel_joint_trajectory(self):
+        if not self.armed:
+            return {'cancelled': False, 'reason': 'not_armed'}
+        return self.live.cancel_joint_trajectory()
+
     def cancel_auto_target(self, axis: str | None = None):
         if not self.armed:
             return {'cancelled': False, 'reason': 'not_armed'}

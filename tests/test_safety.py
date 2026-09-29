@@ -42,8 +42,12 @@ def make_manager(state=None):
     config['live_control']['auto_target_encoder_wrong_way_margin']=40
     config['live_control']['auto_target_swing_wrong_way_margin_deg']=2.0
     config['live_control']['auto_target_max_percent']=5.0
-    client=MemoryClient(config); holder={'state':state or safe_state(),'t':time.monotonic()}
-    mgr=LiveControlManager(client,config,load_variable_map(),lambda:holder['state'],lambda:time.monotonic()-holder['t'])
+    client=MemoryClient(config); holder={'state':state or safe_state(),'t':None}
+    mgr=LiveControlManager(client,config,load_variable_map(),lambda:holder['state'],lambda:None if holder['t'] is None else time.monotonic()-holder['t'])
+    # Timestamp must represent arrival of the simulated DB400 frame, not the start of
+    # manager/config construction.  Fresh Windows virtualenvs can make imports/init
+    # exceed the 600 ms production freshness threshold.
+    holder['t']=time.monotonic()
     return mgr,client,holder
 
 

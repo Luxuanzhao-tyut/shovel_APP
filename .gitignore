@@ -1,7 +1,29 @@
+﻿# Python virtual environments
 .venv/
+venv/
+
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+
+# Test/cache
+.pytest_cache/
+.coverage
+
+# PyInstaller build outputs
 build/
 dist/
-.pytest_cache/
+
+# Runtime records
+records/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
 *.log
